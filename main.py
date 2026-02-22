@@ -13,7 +13,8 @@ load_dotenv()
 token = os.getenv("DISCORD_TOKEN")
 SERVER_ID = os.getenv("MINEHUT_SERVERID1")  # make sure .env has this exact name
 MINEHUT_TOKEN = os.getenv("MINEHUT_TOKEN")  # full "Bearer ey..." string
-
+ADMIN_ROLE_ID = 1475056910741934161
+REQUEST_CHANNEL_ID = 1475103838473162762
 STATUS_CHANNEL_ID = 1475054751581343915  # your target channel id
 STATUS_FILE = "status_message.json"       # stores message id so it persists across restarts
 _status_lock = asyncio.Lock()
@@ -278,7 +279,6 @@ async def assign(ctx):
 
 # minehut control commands
 @bot.command()
-@commands.has_role("Server Admin")
 async def startserver(ctx):
     await ctx.reply("Starting server...")
     # immediate feedback + try to start
@@ -340,6 +340,172 @@ async def serverstatus(ctx):
     else:
         await ctx.reply("⚠️ Could not retrieve the server status. Please check the bot console.")
         await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server status checked", immediate_state="Unknown", wait_seconds=0)
+@bot.command()
+async def requeststop(ctx):
+    """
+    Any user can run this to request a server stop.
+    An embed is posted in REQUEST_CHANNEL_ID with ✅ and ❌.
+    The first reaction from a user having ADMIN_ROLE_ID decides.
+    """
+    requester = ctx.author
+
+    # 1) acknowledge in the invoking channel and DM the user
+    try:
+        await ctx.reply("Your request to stop the server has been made.")
+    except Exception:
+        # fallback to send if reply fails
+        await ctx.send("Your request to stop the server has been made.")
+    try:
+        await requester.send("Your request to stop the server has been made.")
+    except Exception:
+        # can't DM (maybe blocked), ignore silently
+        print(f"couldn't DM user {requester}")
+
+    # 2) prepare embed for admin approval channel
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    embed = discord.Embed(
+        title="🟡 Server Stop Request",
+        description=(
+            f"**Requester:** {requester.mention} (`{requester}`)\n"
+            f"**Requested at:** {now}\n\n"
+            "React with ✅ to approve and stop the server, or ❌ to deny."
+        ),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="Only users with the Senior Admin role can approve/deny this request.")
+
+    # 3) send to admin channel
+    try:
+        admin_channel = bot.get_channel(REQUEST_CHANNEL_ID) or await bot.fetch_channel(REQUEST_CHANNEL_ID)
+    except Exception as e:
+        await ctx.send("Could not find the admin channel. Contact an admin.")
+        print("requeststop: failed to fetch admin channel:", repr(e))
+        return
+
+    try:
+        req_msg = await admin_channel.send(embed=embed)
+    except Exception as e:
+        await ctx.send("Failed to post request in admin channel.")
+        print("requeststop: failed to send embed:", repr(e))
+        return
+
+    # add reactions
+    try:
+        await req_msg.add_reaction("✅")
+        await req_msg.add_reaction("❌")
+    except Exception as e:
+        print("requeststop: failed to add reactions:", repr(e))
+
+    # 4) wait for an admin reaction
+    def check(reaction, user):
+        # only accept reactions on our request message
+        if reaction.message.id != req_msg.id:
+            return False
+        # ignore bot reactions
+        if user.bot:
+            return False
+        # only accept the two emojis we added
+        if str(reaction.emoji) not in ("✅", "❌"):
+            return False
+        # check user has the Senior Admin role in the guild where the command was run
+        # attempt to get the member object from the guild of the invoking context
+        guild = ctx.guild
+        if not guild:
+            return False
+        member = guild.get_member(user.id)
+        if not member:
+            return False
+        return any(r.id == ADMIN_ROLE_ID for r in member.roles)
+
+    timeout_seconds = 3600  # 1 hour, change if you want shorter
+
+    try:
+        reaction, user = await bot.wait_for("reaction_add", timeout=timeout_seconds, check=check)
+    except asyncio.TimeoutError:
+        # timed out, update embed and notify requester
+        try:
+            embed.title = "⚪ Server Stop Request — Timed Out"
+            embed.color = discord.Color.light_grey()
+            embed.description += "\n\nNo Senior Admin responded within the timeout window."
+            await req_msg.edit(embed=embed)
+        except Exception:
+            pass
+        # DM the requester
+        try:
+            await requester.send("Your stop request timed out. No Senior Admin approved or denied it.")
+        except Exception:
+            pass
+        return
+
+    # 5) process admin decision
+    emoji = str(reaction.emoji)
+    approver = user  # the admin who reacted
+
+    # update embed to show who decided
+    decision_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    if emoji == "✅":
+        # approve -> stop server
+        try:
+            embed.title = "🟢 Server Stop Request — Approved"
+            embed.color = discord.Color.green()
+            embed.description += f"\n\n**Approved by:** {approver.mention} (`{approver}`) at {decision_time}"
+            await req_msg.edit(embed=embed)
+        except Exception:
+            pass
+
+        # call the stopping API
+        try:
+            # attempt to stop the server using your existing helper
+            stop_res = await minehut_power("shutdown")
+            if stop_res == 200:
+                result_text = "approved and the server has been stopped."
+                # inform channel and DM requester
+                try:
+                    await admin_channel.send(f"Server stop approved by {approver.mention}. Server is stopping.")
+                except Exception:
+                    pass
+            else:
+                result_text = f"approved but stopping failed (status {stop_res})."
+                try:
+                    await admin_channel.send(f"Server stop approved by {approver.mention} but stopping failed (status {stop_res}).")
+                except Exception:
+                    pass
+        except Exception as e:
+            result_text = f"approved but stopping failed (error)."
+            print("requeststop: error when calling minehut_power:", repr(e))
+
+        # DM requester with result
+        try:
+            await requester.send(f"Your request to stop the server was {result_text}")
+        except Exception:
+            pass
+
+    else:  # emoji == "❌"
+        # denied
+        try:
+            embed.title = "🔴 Server Stop Request — Denied"
+            embed.color = discord.Color.red()
+            embed.description += f"\n\n**Denied by:** {approver.mention} (`{approver}`) at {decision_time}"
+            await req_msg.edit(embed=embed)
+        except Exception:
+            pass
+
+        try:
+            await admin_channel.send(f"Server stop request denied by {approver.mention}. Server will remain running.")
+        except Exception:
+            pass
+
+        # DM requester
+        try:
+            await requester.send("Your request to stop the server was denied by a Senior Admin.")
+        except Exception:
+            pass
+
+    # cleanup: remove reactions so it can't be actioned again
+    try:
+        await req_msg.clear_reactions()
+    except Exception:
+        pass
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingRole):
@@ -347,3 +513,4 @@ async def on_command_error(ctx, error):
     else:
         raise error
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+
