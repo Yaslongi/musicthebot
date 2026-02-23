@@ -17,7 +17,11 @@ ADMIN_ROLE_ID = 1475056910741934161
 REQUEST_CHANNEL_ID = 1475103838473162762
 STATUS_CHANNEL_ID = 1475054751581343915  # your target channel id
 STATUS_FILE = "status_message.json"       # stores message id so it persists across restarts
+SERVER_IP_CHANNEL_ID = 1475037173962113128
+SERVER_IP_FILE = "server_ip_message.json"
+ACTIVE_SERVER_FILE = "active_server.json"
 _status_lock = asyncio.Lock()
+_server_ip_lock = asyncio.Lock()
 # basic checks early so you see clear errors
 def _load_status_msg_id():
     try:
@@ -31,23 +35,161 @@ def _save_status_msg_id(msg_id: int):
     with open(STATUS_FILE, "w", encoding="utf-8") as f:
         json.dump({"message_id": int(msg_id)}, f)
 
+def _load_server_ip_msg_id():
+    try:
+        with open(SERVER_IP_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return int(d.get("message_id"))
+    except Exception:
+        return None
+
+def _save_server_ip_msg_id(msg_id: int):
+    with open(SERVER_IP_FILE, "w", encoding="utf-8") as f:
+        json.dump({"message_id": int(msg_id)}, f)
+
+def _load_active_server_number():
+    try:
+        with open(ACTIVE_SERVER_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            n = str(d.get("server_number"))
+            return n if n in {"1", "2"} else None
+    except Exception:
+        return None
+
+def _save_active_server_number(server_number: str):
+    with open(ACTIVE_SERVER_FILE, "w", encoding="utf-8") as f:
+        json.dump({"server_number": str(server_number)}, f)
+
+def _get_server_id_from_number(server_number: str):
+    if str(server_number) == "2":
+        return os.getenv("MINEHUT_SERVERID2")
+    return os.getenv("MINEHUT_SERVERID1")
+
+def _extract_server_number_from_text(text: str):
+    t = (text or "").lower()
+    if "ninjaarmy2.minehut.gg" in t or "server 2" in t:
+        return "2"
+    if "theninjaarmy.minehut.gg" in t or "server 1" in t:
+        return "1"
+    return None
+
+def _format_server_ip_message(server_number: str):
+    if str(server_number) == "1":
+        ip = "TheNinjaArmy.minehut.gg"
+    elif str(server_number) == "2":
+        ip = "NinjaArmy2.minehut.gg"
+    else:
+        ip = "Unknown"
+    return f"Current server IP: `{ip}` (server {server_number})"
+
+async def _ensure_server_ip_message(server_number: str):
+    channel = bot.get_channel(SERVER_IP_CHANNEL_ID) or await bot.fetch_channel(SERVER_IP_CHANNEL_ID)
+    if channel is None:
+        raise RuntimeError(f"cannot find channel {SERVER_IP_CHANNEL_ID}")
+
+    msg_id = _load_server_ip_msg_id()
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(msg_id)
+            return msg
+        except Exception:
+            pass
+
+    # Fallback: reuse an existing bot IP message if present.
+    try:
+        async for m in channel.history(limit=50):
+            if m.author.id == bot.user.id and m.content.startswith("Current server IP:"):
+                _save_server_ip_msg_id(m.id)
+                return m
+    except Exception:
+        pass
+
+    msg = await channel.send(_format_server_ip_message(server_number))
+    _save_server_ip_msg_id(msg.id)
+    return msg
+
+async def _detect_server_number_from_ip_message():
+    """
+    Reads the tracked IP message (or recent bot IP message) and infers server number.
+    Returns "1"/"2"/None.
+    """
+    try:
+        channel = bot.get_channel(SERVER_IP_CHANNEL_ID) or await bot.fetch_channel(SERVER_IP_CHANNEL_ID)
+        if channel is None:
+            return None
+
+        msg_id = _load_server_ip_msg_id()
+        if msg_id:
+            try:
+                msg = await channel.fetch_message(msg_id)
+                n = _extract_server_number_from_text(msg.content)
+                if n:
+                    return n
+            except Exception:
+                pass
+
+        async for m in channel.history(limit=50):
+            if m.author.id == bot.user.id and m.content.startswith("Current server IP:"):
+                _save_server_ip_msg_id(m.id)
+                n = _extract_server_number_from_text(m.content)
+                if n:
+                    return n
+                break
+    except Exception:
+        return None
+    return None
+
+async def update_server_ip_message(server_number: str):
+    async with _server_ip_lock:
+        try:
+            msg = await _ensure_server_ip_message(server_number)
+            await msg.edit(content=_format_server_ip_message(server_number))
+        except Exception as e:
+            print("update_server_ip_message error:", repr(e))
+
+def _coerce_status_state(result):
+    """
+    Normalize status results into one of:
+    running / stopped / unknown
+    """
+    if isinstance(result, bool):
+        return "running" if result else "stopped"
+
+    if isinstance(result, str):
+        s = result.strip().lower()
+        # direct values first
+        if s in {"running", "online", "started", "active"}:
+            return "running"
+        if s in {"stopped", "offline", "sleeping", "suspended"}:
+            return "stopped"
+
+        # fuzzy fallback
+        if "stop" in s or "shut" in s or "sleep" in s or "off" in s:
+            return "stopped"
+        if "run" in s or "online" in s:
+            return "running"
+
+    return "unknown"
+
+# load last selected server (defaults to 1)
+
+CURRENT_SERVER_NUMBER = _load_active_server_number() or "1"
+SERVER_ID = _get_server_id_from_number(CURRENT_SERVER_NUMBER) or os.getenv("MINEHUT_SERVERID1")
+
 def _format_status_embed(state: str, last_action: str = None, by: str = None):
     """
     Returns (content, embed) where:
     - content is short text (here None)
     - embed is a Discord Embed showing server status
-    state: "running", "stopped", "starting", "stopping", "unknown"
+    state: "running", "stopped", "unknown"
     """
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # emoji + title
     emoji = {
-        "running": "🟢",
-        "stopped": "🔴",
-        "starting": "🟡",
-        "stopping": "🟠",
-        "unknown": "⚪"
-    }.get(state.lower(), "⚪")
+        "running": "\U0001F7E2",
+        "stopped": "\U0001F534",
+        "unknown": "\u26AA"
+    }.get(state.lower(), "\u26AA")
 
     title = f"{emoji} Server Status: {state.capitalize()}"
 
@@ -60,8 +202,6 @@ def _format_status_embed(state: str, last_action: str = None, by: str = None):
     embed = discord.Embed(title=title, description=desc, color={
         "running": discord.Color.green(),
         "stopped": discord.Color.red(),
-        "starting": discord.Color.gold(),
-        "stopping": discord.Color.orange(),
         "unknown": discord.Color.light_grey()
     }.get(state.lower(), discord.Color.light_grey()))
 
@@ -95,7 +235,7 @@ async def _ensure_status_message():
 async def update_status_message(state: str, last_action: str=None, by: str=None):
     """
     call this to update the status message.
-    state: running/stopped/starting/stopping/unknown
+    state: running/stopped/unknown
     last_action: e.g. "start requested"
     by: username or mention who triggered it
     """
@@ -107,30 +247,6 @@ async def update_status_message(state: str, last_action: str=None, by: str=None)
             await msg.edit(content=content, embed=embed)
         except Exception as e:
             print("update_status_message error:", repr(e))
-
-# helper to call after commands: tries to get real state then update message
-async def refresh_and_update(trigger_by: str=None, action_hint: str=None, immediate_state: str=None, wait_seconds: int=3):
-    """
-    - immediate_state: optional quick state to show instantly ("starting","stopping")
-    - wait_seconds: how long to wait then re-check real state
-    """
-    if immediate_state:
-        await update_status_message(immediate_state, last_action=action_hint, by=trigger_by)
-    # wait then check real state
-    try:
-        await asyncio.sleep(wait_seconds)
-        real = await get_minehut_status()
-        if real is True:
-            s = "running"
-        elif real is False:
-            s = "stopped"
-        else:
-            s = "unknown"
-        await update_status_message(s, last_action=action_hint, by=trigger_by)
-    except Exception as e:
-        print("refresh_and_update error:", repr(e))
-        await update_status_message("unknown", last_action="refresh failed", by=trigger_by)
-
 
 # Override with transition-aware polling so start/stop states do not get flipped by short API lag.
 async def refresh_and_update(
@@ -164,12 +280,7 @@ async def refresh_and_update(
                 await asyncio.sleep(wait_seconds)
 
             real = await get_minehut_status()
-            if real is True:
-                current = "running"
-            elif real is False:
-                current = "stopped"
-            else:
-                current = "unknown"
+            current = _coerce_status_state(real)
 
             last_seen = current
 
@@ -183,10 +294,12 @@ async def refresh_and_update(
 
             elapsed += poll_interval
             if elapsed >= timeout_seconds:
-                if last_seen in {"running", "stopped"}:
+                # If we expected a specific final state but never reached it,
+                # keep the expected final instead of flipping to unknown.
+                if expected is not None and last_seen != expected:
+                    await update_status_message(expected, last_action=action_hint, by=trigger_by)
+                elif last_seen in {"running", "stopped"}:
                     await update_status_message(last_seen, last_action=action_hint, by=trigger_by)
-                elif immediate_state:
-                    await update_status_message(immediate_state, last_action=action_hint, by=trigger_by)
                 else:
                     await update_status_message("unknown", last_action=action_hint, by=trigger_by)
                 return
@@ -228,7 +341,32 @@ async def get_minehut_status():
                 if resp.status != 200:
                     return None
                 data = await resp.json()
-                return bool(data.get("server", {}).get("online"))
+                server = data.get("server", {}) or {}
+
+                # Most reliable signal: explicit online boolean.
+                online_value = server.get("online")
+                if isinstance(online_value, bool):
+                    normalized = _coerce_status_state(online_value)
+                    print("minehut parsed state:", normalized, "| raw online:", repr(online_value))
+                    return normalized
+
+                # Prefer explicit lifecycle/status text when available.
+                candidates = [
+                    server.get("state"),
+                    server.get("status"),
+                    server.get("lifecycle_state"),
+                    data.get("state"),
+                    data.get("status"),
+                ]
+                for c in candidates:
+                    normalized = _coerce_status_state(c)
+                    if normalized != "unknown":
+                        print("minehut parsed state:", normalized, "| raw:", repr(c))
+                        return normalized
+
+                normalized = "stopped"
+                print("minehut parsed state:", normalized, "| raw fallback (no online/state)")
+                return normalized
     except Exception as e:
         print("get_minehut_status exception:", repr(e))
         return None
@@ -261,7 +399,18 @@ async def minehut_power(action):
 
 @bot.event
 async def on_ready():
+    global SERVER_ID, CURRENT_SERVER_NUMBER
+    if _load_active_server_number() is None:
+        detected = await _detect_server_number_from_ip_message()
+        if detected in {"1", "2"}:
+            CURRENT_SERVER_NUMBER = detected
+            _save_active_server_number(detected)
+            SERVER_ID = _get_server_id_from_number(detected) or SERVER_ID
     print(f"bot is ready and running, {bot.user.name}")
+    try:
+        await update_server_ip_message(CURRENT_SERVER_NUMBER)
+    except Exception as e:
+        print("on_ready server ip sync error:", repr(e))
 
 @bot.command()
 async def hello(ctx):
@@ -276,6 +425,53 @@ async def assign(ctx):
     else:
         await ctx.send("role doesn't exist bro")
 
+@bot.command()
+async def switchserver(ctx, *, msg):
+    global SERVER_ID, CURRENT_SERVER_NUMBER
+    if msg == "1":
+        await ctx.reply("Switching to server 1...")
+        try:
+            SERVER_ID = os.getenv("MINEHUT_SERVERID1")
+            CURRENT_SERVER_NUMBER = "1"
+            _save_active_server_number("1")
+            await update_server_ip_message("1")
+            await ctx.reply("Switched to server 1 successfully!")
+            result = await get_minehut_status()
+            state = _coerce_status_state(result)
+            if state == "running":
+                await ctx.reply("\U0001F7E2 The server is currently running.")
+                await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server switched", immediate_state="Running", wait_seconds=0)
+            elif state == "stopped":
+                await ctx.reply("\U0001F534 The server is currently stopped.")
+                await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server switched", immediate_state="Stopped", wait_seconds=0)
+            else:
+                await ctx.reply("Could not retrieve the server status. Please check the bot console.")
+        except Exception as e:
+            await ctx.reply("Failed to switch server. Check the bot console.")
+            print("switchserver error:", repr(e))
+    elif msg == "2":
+        await ctx.reply("Switching to server 2...")
+        try:
+            SERVER_ID = os.getenv("MINEHUT_SERVERID2")
+            CURRENT_SERVER_NUMBER = "2"
+            _save_active_server_number("2")
+            await update_server_ip_message("2")
+            await ctx.reply("Switched to server 2 successfully!")
+            result = await get_minehut_status()
+            state = _coerce_status_state(result)
+            if state == "running":
+                await ctx.reply("\U0001F7E2 The server is currently running.")
+                await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server switched", immediate_state="Running", wait_seconds=0)
+            elif state == "stopped":
+                await ctx.reply("\U0001F534 The server is currently stopped.")
+                await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server switched", immediate_state="Stopped", wait_seconds=0)
+            else:
+                await ctx.reply("Could not retrieve the server status. Please check the bot console.")
+        except Exception as e:
+            await ctx.reply("Failed to switch server. Check the bot console.")
+            print("switchserver error:", repr(e))
+    else:
+        await ctx.reply("Invalid server number. Use `!switchserver 1` or `!switchserver 2`.")
 
 # minehut control commands
 @bot.command()
@@ -288,7 +484,7 @@ async def startserver(ctx):
         await refresh_and_update(
             trigger_by=str(ctx.author),
             action_hint="Start requested",
-            immediate_state="starting",
+            immediate_state="running",
             wait_seconds=3,
             expected_final="running",
             timeout_seconds=45,
@@ -310,11 +506,11 @@ async def stopserver(ctx):
     await ctx.reply("Stopping server...")
     res = await minehut_power("shutdown")
     if res == 200:
-        await ctx.reply("The server has been stopped.")
+        await ctx.reply("\U0001F534 The server has been stopped.")
         await refresh_and_update(
             trigger_by=str(ctx.author),
             action_hint="Shutdown requested",
-            immediate_state="stopping",
+            immediate_state="stopped",
             wait_seconds=3,
             expected_final="stopped",
             timeout_seconds=45,
@@ -327,19 +523,7 @@ async def stopserver(ctx):
         await ctx.reply(f"Failed to stop the server (Status {res}).")
         await refresh_and_update(trigger_by=str(ctx.author), action_hint=f"Stop failed ({res})", immediate_state="Unknown")
 
-@bot.command()
-async def serverstatus(ctx):
-    await ctx.reply("Checking server status...")
-    result = await get_minehut_status()
-    if result is True:
-        await ctx.reply("🟢 The server is currently running.")
-        await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server status checked", immediate_state="Running", wait_seconds=0)
-    elif result is False:
-        await ctx.reply("🔴 The server is currently stopped.")
-        await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server status checked", immediate_state="Stopped", wait_seconds=0)
-    else:
-        await ctx.reply("⚠️ Could not retrieve the server status. Please check the bot console.")
-        await refresh_and_update(trigger_by=str(ctx.author), action_hint="Server status checked", immediate_state="Unknown", wait_seconds=0)
+
 @bot.command()
 async def requeststop(ctx):
     """
@@ -513,4 +697,6 @@ async def on_command_error(ctx, error):
     else:
         raise error
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
+
+
 
